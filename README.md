@@ -79,7 +79,7 @@ flowchart TD
 | **Auth** | JWT (python-jose) · bcrypt password hashing |
 | **Rate Limiting** | Redis (fixed-window counters) |
 | **Persistence** | PostgreSQL |
-| **Infrastructure** | AWS EC2 (t3.small, Ubuntu) — self-provisioned, not a managed lab environment |
+| **Infrastructure** | AWS EC2 (Ubuntu) — self-provisioned, not a managed lab environment |
 
 ---
 
