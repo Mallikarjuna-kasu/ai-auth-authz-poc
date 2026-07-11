@@ -85,193 +85,57 @@ flowchart TD
 
 ## 🧪 Evidence — Real Terminal Output (Success + Failure)
 
-All output below is captured directly from the live EC2 instance. Nothing here is simulated or copied from documentation — every block is a real command run against a running service.
+All screenshots below are captured directly from the live EC2 instance (`palyamiq-abac-sod`, AWS t3.small, Ubuntu). Nothing here is simulated or copied from documentation — every image is a real command run against a running service, across two independent sessions.
 
 ### Module 1 — API Key Management
 
-**✅ Success — key generated and validated**
-```
-$ python src/test_keys.py
-Generating API key...
-Generated key: aip_KrTzQ7mXvEibvX6l...
-Key ID: 1
-Validating key...
-Validation result: {'key_id': 1, 'tenant_id': 'tenant-001', 'name': 'Production API Key', 'scopes': ['chat', 'embeddings'], 'rate_limit': 100}
-```
+**✅ Key generation, validation, rate limiting, invalid key rejection**
 
-**✅ Success — rate limit counts down correctly**
-```
-Testing rate limit...
-Request 1: allowed=True, remaining=99
-Request 2: allowed=True, remaining=98
-Request 3: allowed=True, remaining=97
-```
+![Module 1 - Key lifecycle](images/Module_1.png)
 
-**❌ Failure (expected) — invalid key rejected**
-```
-Testing invalid key...
-Invalid key result: None
-```
+*Key generated and validated with full metadata, rate limit correctly counts down (`99 → 98 → 97`), invalid key correctly returns `None`.*
 
-**❌ Failure (expected) — revoked key rejected even though it's syntactically valid**
-```
-$ python test_revoke.py
-Validation BEFORE revoke: {'key_id': 2, 'tenant_id': 'tenant-001', 'name': 'Revoke Test Key', ...}
-revoke_key() returned: True
-Validation AFTER revoke: None
-Test 1.5 PASS: revoked key correctly rejected even though it's syntactically valid
-```
+**❌ Revoked key rejected — even though it's syntactically valid**
 
-**❌ Failure (expected) — rate limit blocks at the ceiling**
-```
-$ for i in $(seq 1 15); do ... done
-Request 1: HTTP 200
-Request 2: HTTP 200
-...
-Request 10: HTTP 200
-Request 11: HTTP 429
-Request 12: HTTP 429
-Request 13: HTTP 429
-Request 14: HTTP 429
-Request 15: HTTP 429
-```
+![Module 1 - Revoke test](images/Revoke.png)
+
+*A freshly generated, correctly-hashed key validates successfully before revocation, then is rejected immediately after `revoked=TRUE` is set — proving the revocation check actually holds, not just key format.*
 
 ---
 
 ### Module 2 — OAuth 2.0 / JWT
 
-**✅ Success — token issued**
-```
-$ curl -X POST "http://localhost:8080/oauth/token" \
-  -d "username=service-account@tenant-001&password=secret123"
+**❌ Tampered signature rejected**
 
-{"access_token":"eyJhbGciOiJIUzI1NiIs...","refresh_token":"eyJhbGciOiJIUzI1NiIs...","token_type":"bearer","expires_in":1800}
-```
+![Module 2 - Tampered signature](images/Module2-Tampered_signature_rejected.png)
 
-**✅ Success — protected endpoint grants access, and refresh preserves original scopes**
-```
-$ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/protected
-{"message":"Access granted","user":{"user_id":"service-account@tenant-001","tenant_id":"tenant-001","scopes":["chat","embeddings","admin"]}}
-
-$ curl -H "Authorization: Bearer $NEW_TOKEN" http://localhost:8080/protected
-{"message":"Access granted","user":{"user_id":"service-account@tenant-001","tenant_id":"tenant-001","scopes":["chat","embeddings","admin"]}}
-```
-*Identical scopes on original and refreshed token — refresh does not grant elevated access.*
-
-**❌ Failure (expected) — tampered signature rejected**
-```
-$ curl -H "Authorization: Bearer $BAD_TOKEN" http://localhost:8080/protected
-HTTP status: 401
-```
-
-**❌ Failure (expected) — access token rejected when used as a refresh token**
-```
-$ curl -X POST "http://localhost:8080/oauth/refresh" -d '{"refresh_token": "'"$TOKEN"'"}'
-{"detail":"Invalid refresh token"}
-```
+*Corrupting the last character of a valid JWT and replaying it returns `401 Unauthorized` — signature verification catches the tamper.*
 
 **⚠️ Confirmed finding — refresh token reuse is NOT blocked**
-```
---- First use of REFRESH ---
-{"access_token":"eyJhbGciOiJIUzI1NiIs...Cd66-WmjjdK0uGd9Hx1q1CF4l...","token_type":"bearer","expires_in":1800}
 
---- Second use of the SAME REFRESH token ---
-{"access_token":"eyJhbGciOiJIUzI1NiIs...Cd66-WmjjdK0uGd9Hx1q1CF4l...","token_type":"bearer","expires_in":1800}
-```
-*Both calls returned `200` with a valid new access token. Confirmed a third time via manual retry — same result. No rejection, no rotation.*
+![Module 2 - Refresh reuse finding](images/Module2-The_finding_png.png)
+
+*The exact same refresh token used twice, back to back — both calls return `200 OK` with a valid access token. No rejection, no rotation. This is the centerpiece finding of this POC: the refresh endpoint verifies token signature and type, but never tracks whether a given refresh token has already been redeemed. A leaked refresh token functions as a standing 7-day credential, not a one-time exchange token.*
 
 ---
 
 ### Module 3 — Multi-Tenant Isolation
 
-**✅ Success — enterprise tenant accesses gpt-4**
-```
-$ curl -X POST "http://localhost:8081/chat" -H "X-API-Key: $TENANT1_KEY" \
-  -d '{"model": "gpt-4", "messages": [...]}'
+**✅ Enterprise tenant succeeds, ❌ Standard tenant denied — same model, different tiers**
 
-{
-    "tenant_id": "tenant-001",
-    "model": "gpt-4",
-    "response": "Response for tenant tenant-001 using gpt-4",
-    "tokens_used": 100
-}
-```
+![Module 3 - Tenant tiering](images/Module3-tenant-tiering.png)
 
-**❌ Failure (expected) — standard tenant denied gpt-4**
-```
-$ curl -X POST "http://localhost:8081/chat" -H "X-API-Key: $TENANT2_KEY" \
-  -d '{"model": "gpt-4", "messages": [...]}'
-
-{
-    "detail": "Model 'gpt-4' not available for standard tier"
-}
-```
-
-**✅ Success — tenant quota info accurate**
-```
-$ curl -H "X-API-Key: $TENANT1_KEY" "http://localhost:8081/tenant/info"
-{
-    "tenant_id": "tenant-001",
-    "name": "Acme Corp",
-    "tier": "enterprise",
-    "quotas": {"requests_per_minute": 1000, "max_tokens_per_request": 8192, "max_context_length": 32000},
-    "allowed_models": ["gpt-4", "gpt-3.5-turbo", "claude-3-opus"],
-    "data_region": "us-east-1"
-}
-```
-
-**❌ Failure (expected — attack attempt) — spoofed tenant_id in request body is ignored**
-```
-$ curl -X POST "http://localhost:8081/chat" -H "X-API-Key: $TENANT2_KEY" \
-  -d '{"model": "gpt-3.5-turbo", "tenant_id": "tenant-001", "messages": [...]}'
-
-{
-    "tenant_id": "tenant-002",
-    "model": "gpt-3.5-turbo",
-    "response": "Response for tenant tenant-002 using gpt-3.5-turbo",
-    "tokens_used": 100
-}
-```
-*Note: response correctly shows `tenant-002` despite the request body attempting to claim `tenant-001` — identity resolved server-side only.*
+*Tenant-001 (enterprise tier) requests `gpt-4` → `200 OK`. Tenant-002 (standard tier) requests the exact same model → `403 Forbidden`, `"Model 'gpt-4' not available for standard tier"`. Tier enforcement happens at the middleware layer, before any business logic runs.*
 
 ---
 
 ### Module 4 — Audit Logging
 
-**✅ Success — usage summary aggregates correctly**
-```
-$ curl -H "X-API-Key: $TENANT1_KEY" "http://localhost:8082/audit/summary"
-{
-    "total_requests": 5,
-    "active_days": 1,
-    "avg_response_time_ms": 42.4,
-    "error_count": 0,
-    "total_tokens": 500
-}
-```
+**❌ SQL injection attempt logged as inert text, table integrity confirmed**
 
-**❌ Failure (expected — attack attempt) — SQL injection logged as inert text, table survives**
-```
-$ curl -X POST "http://localhost:8082/chat" -H "X-API-Key: $TENANT1_KEY" \
-  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "'\''; DROP TABLE audit_logs; --"}]}'
+![Module 4 - SQL injection](images/Module4-sql-injection.png)
 
-{"tenant_id":"tenant-001","model":"gpt-4","response":"This is an audited response","tokens_used":50}
-
-$ psql -c "\dt"
-              List of tables
- Schema |    Name    | Type  |   Owner
---------+------------+-------+------------
- public | api_keys   | table | aiplatform
- public | audit_logs | table | aiplatform
-(2 rows)
-
-$ psql -c "SELECT COUNT(*) FROM audit_logs;"
- count
--------
-     6
-(1 row)
-```
-*The injection payload was stored verbatim as harmless text in the logged request body — table intact, count correct, nothing executed.*
+*A `'; DROP TABLE audit_logs; --` payload sent as chat message content is stored verbatim as harmless text in the audit log — the request still returns `200 OK`, and a follow-up `\dt` confirms the `audit_logs` table is intact. Parameterized queries throughout the audit pipeline are what make this hold.*
 
 ---
 
